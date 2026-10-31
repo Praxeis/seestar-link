@@ -10,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/zrbecker/seestar-remote/internal/tnauth"
+	"github.com/Praxeis/seestar-link/internal/tnauth"
 )
 
 const (

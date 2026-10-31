@@ -11,13 +11,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
 	"golang.org/x/term"
 
-	"github.com/zrbecker/seestar-remote/kalay"
-	"github.com/zrbecker/seestar-remote/seestar"
+	"github.com/Praxeis/seestar-link/internal/config"
+	"github.com/Praxeis/seestar-link/internal/secret"
+	"github.com/Praxeis/seestar-link/kalay"
+	"github.com/Praxeis/seestar-link/seestar"
 )
 
 // EnvOr returns the environment value for k, or def when unset.
@@ -41,11 +44,12 @@ func EnvIntOr(k string, def int) int {
 // NoPrompt reports whether prompting is disabled, by flag or by SEESTAR_NO_PROMPT.
 func NoPrompt(flag bool) bool { return flag || os.Getenv("SEESTAR_NO_PROMPT") != "" }
 
-// Resolve builds a ConnectConfig. Credentials come from SEESTAR_EMAIL/SEESTAR_PASSWORD and
-// the device from SEESTAR_SN/SEESTAR_MODEL; anything unset is prompted for, selecting the
-// device from the account's list. With noPrompt set, a missing value is an error instead,
-// so scripted runs fail rather than block. The returned config carries the access token, so
-// Dial does not log in again.
+// Resolve builds a ConnectConfig. Each value is taken from the first place that has it:
+// the environment (SEESTAR_EMAIL, SEESTAR_PASSWORD, SEESTAR_SN, SEESTAR_MODEL,
+// SEESTAR_MASTER), then the selected profile and the saved password for its account, then
+// an interactive prompt. With noPrompt set, a missing value is an error instead, so scripted
+// runs and services fail rather than block. The returned config carries the access token,
+// so Dial does not log in again.
 func Resolve(noPrompt bool) (seestar.ConnectConfig, error) {
 	var cfg seestar.ConnectConfig
 
@@ -54,15 +58,31 @@ func Resolve(noPrompt bool) (seestar.ConnectConfig, error) {
 		return cfg, err
 	}
 
-	email, password := os.Getenv("SEESTAR_EMAIL"), os.Getenv("SEESTAR_PASSWORD")
+	_, prof, _, err := Profile()
+	if err != nil {
+		return cfg, err
+	}
+
+	email := firstOf(os.Getenv("SEESTAR_EMAIL"), prof.Email)
+	password := os.Getenv("SEESTAR_PASSWORD")
+	if email != "" && password == "" {
+		switch pw, err := secret.Get(email); {
+		case err == nil:
+			password = pw
+		case !errors.Is(err, secret.ErrNotFound):
+			fmt.Fprintf(os.Stderr, "warning: %v\n", err)
+		}
+	}
 	if email == "" || password == "" {
 		if noPrompt {
-			return cfg, fmt.Errorf("SEESTAR_EMAIL and SEESTAR_PASSWORD must be set when prompting is disabled")
+			return cfg, fmt.Errorf("no saved login: run 'seestar login' (or set SEESTAR_EMAIL and SEESTAR_PASSWORD)")
 		}
-		if email, err = ask("ZWO account email: "); err != nil {
-			return cfg, err
+		if email == "" {
+			if email, err = ask("ZWO account email: "); err != nil {
+				return cfg, err
+			}
 		}
-		if password, err = askSecret("Password: "); err != nil {
+		if password, err = askSecret("Password for " + email + ": "); err != nil {
 			return cfg, err
 		}
 	}
@@ -72,7 +92,8 @@ func Resolve(noPrompt bool) (seestar.ConnectConfig, error) {
 		return cfg, err
 	}
 
-	sn, model := os.Getenv("SEESTAR_SN"), os.Getenv("SEESTAR_MODEL")
+	sn := firstOf(os.Getenv("SEESTAR_SN"), prof.Sn)
+	model := firstOf(os.Getenv("SEESTAR_MODEL"), prof.Model)
 	if sn == "" {
 		if sn, model, err = selectDevice(token, noPrompt); err != nil {
 			return cfg, err
@@ -88,9 +109,61 @@ func Resolve(noPrompt bool) (seestar.ConnectConfig, error) {
 		Token:             token,
 		DeviceModel:       model,
 		DeviceSn:          sn,
-		Master:            EnvOr("SEESTAR_MASTER", "119.45.181.137:3478"),
+		Master:            firstOf(os.Getenv("SEESTAR_MASTER"), prof.Master, DefaultMaster),
 		ClientHelloRecord: chRecord,
 	}, nil
+}
+
+// DefaultMaster is the Kalay rendezvous master used when nothing overrides it.
+const DefaultMaster = "119.45.181.137:3478"
+
+func firstOf(vals ...string) string {
+	for _, v := range vals {
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+// Shared flags, registered by ParseFlags on every command.
+var (
+	profileFlag   string
+	configDirFlag string
+	logFlag       string
+)
+
+// Profile returns the profile selected by -profile or SEESTAR_PROFILE, else the default.
+// ok is false when no profiles are configured, which is not an error: the environment and
+// prompts still work as they did before profiles existed.
+func Profile() (name string, p config.Profile, ok bool, err error) {
+	c, err := config.Load()
+	if err != nil {
+		return "", p, false, err
+	}
+	return c.Pick(firstOf(profileFlag, os.Getenv("SEESTAR_PROFILE")))
+}
+
+// ProfileName returns the explicitly requested profile name, if any.
+func ProfileName() string { return firstOf(profileFlag, os.Getenv("SEESTAR_PROFILE")) }
+
+// SelectDevice logs in with token and returns the chosen device. It is exported for the
+// profile setup commands.
+func SelectDevice(token string) (seestar.Device, error) {
+	devices, err := seestar.ListDevices(token, "")
+	if err != nil {
+		return seestar.Device{}, err
+	}
+	sn, _, err := pickDevice(devices, false)
+	if err != nil {
+		return seestar.Device{}, err
+	}
+	for _, d := range devices {
+		if d.Sn == sn {
+			return d, nil
+		}
+	}
+	return seestar.Device{}, fmt.Errorf("device %s vanished from the list", sn)
 }
 
 // selectDevice lists the account's devices and returns the chosen serial and model. A sole
@@ -100,6 +173,11 @@ func selectDevice(token string, noPrompt bool) (sn, model string, err error) {
 	if err != nil {
 		return "", "", err
 	}
+	return pickDevice(devices, noPrompt)
+}
+
+// pickDevice chooses from a device list, prompting when there is more than one.
+func pickDevice(devices []seestar.Device, noPrompt bool) (sn, model string, err error) {
 	switch len(devices) {
 	case 0:
 		return "", "", fmt.Errorf("no devices registered to this account")
@@ -190,15 +268,25 @@ func askSecret(prompt string) (string, error) {
 	return string(b), nil
 }
 
+// Ask prompts on stderr and reads a line from stdin.
+func Ask(prompt string) (string, error) { return ask(prompt) }
+
+// AskSecret prompts and reads without echo when stdin is a terminal.
+func AskSecret(prompt string) (string, error) { return askSecret(prompt) }
+
 // ConnectEnvUsage documents the environment Resolve reads. Commands append their own.
-const ConnectEnvUsage = `  SEESTAR_EMAIL, SEESTAR_PASSWORD
-        ZWO account. Prompted for when unset.
+const ConnectEnvUsage = `  SEESTAR_PROFILE
+        Profile to use, same as -profile. Defaults to 'seestar profile use'.
+  SEESTAR_EMAIL, SEESTAR_PASSWORD
+        ZWO account. Override the profile and the saved login.
   SEESTAR_SN
-        Device serial. Chosen from the account's devices when unset.
+        Device serial. Overrides the profile; chosen from the account when unset.
   SEESTAR_MODEL
-        Device model. Taken from the device list when unset.
+        Device model. Taken from the profile or the device list when unset.
   SEESTAR_MASTER
-        Kalay rendezvous master (default 119.45.181.137:3478).
+        Kalay rendezvous master (default ` + DefaultMaster + `).
+  SEESTAR_CONFIG_DIR
+        Configuration directory, same as -config-dir.
   SEESTAR_CH
         Override the embedded DTLS ClientHello with a 570-hex file (rarely needed).
   SEESTAR_NO_PROMPT
@@ -206,14 +294,23 @@ const ConnectEnvUsage = `  SEESTAR_EMAIL, SEESTAR_PASSWORD
   KALAY_TUN_DEBUG
         Set for tunnel and RDT tracing on stderr.`
 
-// ParseFlags parses the command line, printing usage for -h/--help and exiting 0. A
-// genuine flag error prints usage and exits 2.
+// ProgName is the name commands use in their usage text and errors. The seestar
+// dispatcher sets it to "seestar <command>".
+var ProgName = os.Args[0]
+
+// ParseFlags registers the shared flags (-profile, -config-dir, -log), parses the command
+// line, prints usage for -h/--help and exits 0. A genuine flag error prints usage and
+// exits 2.
 func ParseFlags(usage func()) {
-	flag.CommandLine.Init(os.Args[0], flag.ContinueOnError)
+	flag.CommandLine.Init(ProgName, flag.ContinueOnError)
+	flag.StringVar(&profileFlag, "profile", "", "profile to use (see 'seestar profile list')")
+	flag.StringVar(&configDirFlag, "config-dir", "", "configuration directory (default: your user config folder)")
+	flag.StringVar(&logFlag, "log", "", "append output to this file instead of the console")
 	flag.CommandLine.SetOutput(io.Discard) // suppress the package's own error/usage output
 	flag.Usage = func() {}
 	err := flag.CommandLine.Parse(os.Args[1:])
 	if err == nil {
+		applyShared()
 		return
 	}
 	flag.CommandLine.SetOutput(os.Stderr)
@@ -223,4 +320,32 @@ func ParseFlags(usage func()) {
 	}
 	fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
 	os.Exit(2)
+}
+
+// applyShared acts on the shared flags once parsed.
+func applyShared() {
+	if configDirFlag != "" {
+		config.SetDir(configDirFlag)
+	}
+	if logFlag != "" {
+		if err := RedirectOutput(logFlag); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+	}
+}
+
+// RedirectOutput sends everything the process prints to path, appending.
+func RedirectOutput(path string) error {
+	if dir := filepath.Dir(path); dir != "" {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("log: %w", err)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return fmt.Errorf("log: %w", err)
+	}
+	os.Stdout, os.Stderr = f, f
+	return nil
 }

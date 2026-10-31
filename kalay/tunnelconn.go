@@ -750,6 +750,25 @@ func (t *Tunnel) writeChan(idx byte, p []byte) (int, error) {
 	}
 }
 
+// Done returns a channel closed when the tunnel has failed or been closed. A supervisor can
+// select on it to learn the session is gone without owning a reader.
+func (t *Tunnel) Done() <-chan struct{} { return t.closed }
+
+// Err returns the error that ended the tunnel, or nil while it is still up.
+func (t *Tunnel) Err() error {
+	select {
+	case <-t.closed:
+	default:
+		return nil
+	}
+	t.rmu.Lock()
+	defer t.rmu.Unlock()
+	if t.rerr == nil {
+		return fmt.Errorf("tunnel closed")
+	}
+	return t.rerr
+}
+
 // Close tears down the tunnel and its session.
 func (t *Tunnel) Close() error {
 	t.closeMu.Do(func() { close(t.closed) })

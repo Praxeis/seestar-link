@@ -1,4 +1,4 @@
-module github.com/zrbecker/seestar-remote
+module github.com/Praxeis/seestar-link
 
 go 1.26
 

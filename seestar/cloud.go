@@ -11,8 +11,8 @@ import (
 	"net/url"
 	"os"
 
-	"github.com/zrbecker/seestar-remote/internal/tnauth"
-	"github.com/zrbecker/seestar-remote/kalay"
+	"github.com/Praxeis/seestar-link/internal/tnauth"
+	"github.com/Praxeis/seestar-link/kalay"
 )
 
 // ConnectConfig configures cloud authorization and the Kalay tunnel to a device port.
