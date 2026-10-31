@@ -128,6 +128,11 @@ func (t *Tunnel) ackOutbound(ack uint64) {
 // sampleRTT folds a round-trip sample into the smoothed estimate (Jacobson/Karels) and
 // recomputes the retransmit timeout, clamped to a sane range.
 func (t *Tunnel) sampleRTT(s time.Duration) {
+	// A zero sample is possible where the monotonic clock is coarse (Windows ticks in
+	// fractions of a millisecond), and srtt == 0 means "no sample yet", so floor it.
+	if s < time.Microsecond {
+		s = time.Microsecond
+	}
 	if t.srtt == 0 {
 		t.srtt, t.rttvar = s, s/2
 	} else {
