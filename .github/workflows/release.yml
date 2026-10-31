@@ -1,0 +1,44 @@
+name: Release
+# Push a tag such as v0.1.0 to build the seestar binaries and attach them to a GitHub release.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go test ./...
+      - name: build
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          set -e
+          mkdir -p dist
+          for t in windows/amd64 windows/arm64 darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 linux/arm; do
+            os=${t%/*}; arch=${t#*/}
+            name=seestar-$VERSION-$os-$arch
+            mkdir -p build/$name
+            ext=""; [ "$os" = windows ] && ext=.exe
+            GOOS=$os GOARCH=$arch CGO_ENABLED=0 go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o build/$name/seestar$ext ./cmd/seestar
+            cp README.md LICENSE build/$name/
+            if [ "$os" = windows ]; then
+              (cd build && zip -qr ../dist/$name.zip $name)
+            else
+              tar -C build -czf dist/$name.tar.gz $name
+            fi
+          done
+          (cd dist && sha256sum * > SHA256SUMS.txt)
+      - name: publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" dist/* \
+            --title "${{ github.ref_name }}" --generate-notes

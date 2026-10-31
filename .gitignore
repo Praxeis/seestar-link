@@ -7,3 +7,7 @@
 *.log
 ch.hex
 .env*
+/seestar
+/seestar.exe
+/dist/
+/build/

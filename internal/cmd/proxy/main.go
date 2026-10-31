@@ -70,7 +70,7 @@ func Main() {
 	noPrompt := flag.Bool("no-prompt", false, "fail instead of prompting for anything unset")
 	cli.ParseFlags(usage)
 
-	if err := run(context.Background(), maps, *listen, *status, !*noReconnect, cli.NoPrompt(*noPrompt)); err != nil {
+	if err := run(context.Background(), maps, *listen, *status, !*noReconnect, cli.NoPrompt(*noPrompt), false); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
@@ -79,10 +79,10 @@ func Main() {
 // RunService runs the proxy for a background service: no prompting, always reconnecting,
 // settings from the profile, until ctx is cancelled.
 func RunService(ctx context.Context) error {
-	return run(ctx, nil, "", "", true, true)
+	return run(ctx, nil, "", "", true, true, true)
 }
 
-func run(ctx context.Context, maps mappings, listen, status string, reconnect, noPrompt bool) error {
+func run(ctx context.Context, maps mappings, listen, status string, reconnect, noPrompt, service bool) error {
 	name, prof, _, err := cli.Profile()
 	if err != nil {
 		return err
@@ -107,13 +107,24 @@ func run(ctx context.Context, maps mappings, listen, status string, reconnect, n
 		status = ""
 	}
 
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	cfg, err := cli.Resolve(noPrompt)
+	// A service can start before the network is up, so it keeps trying to log in rather
+	// than exiting; interactive runs report the problem straight away.
+	for wait := 10 * time.Second; err != nil && service; wait = min(wait*2, 2*time.Minute) {
+		logf("login failed: %v; retrying in %s", err, wait)
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-time.After(wait):
+		}
+		cfg, err = cli.Resolve(noPrompt)
+	}
 	if err != nil {
 		return err
 	}
-
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	return Run(ctx, cfg, Options{
 		Profile:    name,

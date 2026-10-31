@@ -11,6 +11,23 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go build ./...
       - run: go vet ./...
+      - run: go test -race ./...
+      - name: cross-compile
+        run: |
+          for t in windows/amd64 darwin/arm64 darwin/amd64 linux/arm64 linux/arm; do
+            echo "== $t"
+            GOOS=${t%/*} GOARCH=${t#*/} go vet ./...
+            GOOS=${t%/*} GOARCH=${t#*/} go build -o /dev/null ./cmd/seestar
+          done
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
       - run: go test ./...

@@ -296,7 +296,7 @@ const ConnectEnvUsage = `  SEESTAR_PROFILE
 
 // ProgName is the name commands use in their usage text and errors. The seestar
 // dispatcher sets it to "seestar <command>".
-var ProgName = os.Args[0]
+var ProgName = strings.TrimSuffix(filepath.Base(os.Args[0]), ".exe")
 
 // ParseFlags registers the shared flags (-profile, -config-dir, -log), parses the command
 // line, prints usage for -h/--help and exits 0. A genuine flag error prints usage and
@@ -341,6 +341,10 @@ func RedirectOutput(path string) error {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("log: %w", err)
 		}
+	}
+	// Keep the log bounded: past 5 MB it is rotated to path.1, replacing the previous one.
+	if fi, err := os.Stat(path); err == nil && fi.Size() > 5<<20 {
+		os.Rename(path, path+".1")
 	}
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
