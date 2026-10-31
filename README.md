@@ -275,8 +275,10 @@ ZWO cloud auth (login + online-link)           seestar/cloud.go
 
 ## Releasing
 
-Push a tag such as `v0.1.0`; the Release workflow builds every platform and attaches the
-archives and `SHA256SUMS.txt` to a GitHub release.
+Push a tag such as `v0.1.0`, or on GitHub choose Releases, Draft a new release, type a
+new tag such as `v0.1.0` and publish. Either way the Release workflow builds every
+platform and attaches the archives and `SHA256SUMS.txt` to that release within a few
+minutes.
 
 ## License
 

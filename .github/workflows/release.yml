@@ -1,5 +1,6 @@
 name: Release
-# Push a tag such as v0.1.0 to build the seestar binaries and attach them to a GitHub release.
+# Push a tag such as v0.1.0, or publish a release with a new tag on the GitHub website, to
+# build the seestar binaries and attach them to that release.
 on:
   push:
     tags: ["v*"]
@@ -39,6 +40,12 @@ jobs:
       - name: publish
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          gh release create "${{ github.ref_name }}" dist/* \
-            --title "${{ github.ref_name }}" --generate-notes
+          # Works whether the tag was pushed from git (no release yet) or the release was
+          # created on the GitHub website (which creates the tag too).
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "$TAG" --generate-notes
+          fi
