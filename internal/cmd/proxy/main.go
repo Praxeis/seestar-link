@@ -136,6 +136,4 @@ func run(ctx context.Context, maps mappings, listen, status string, reconnect, n
 	})
 }
 
-func logf(format string, args ...any) {
-	fmt.Fprintf(os.Stdout, "%s  %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
-}
+func logf(format string, args ...any) { cli.Logf(format, args...) }

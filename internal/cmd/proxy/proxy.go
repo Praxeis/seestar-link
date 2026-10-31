@@ -104,6 +104,19 @@ func Run(ctx context.Context, cfg seestar.ConnectConfig, opts Options) error {
 	if opts.Logf == nil {
 		opts.Logf = func(string, ...any) {}
 	}
+	// The first mapping rides the tunnel's own channel, which cannot be reopened, so it must
+	// be a port that keeps its socket open. Move a port 80 mapping out of first place.
+	maps := append([]Mapping(nil), opts.Maps...)
+	for i, m := range maps {
+		if m.Device != 80 {
+			maps[0], maps[i] = maps[i], maps[0]
+			break
+		}
+	}
+	if maps[0].Device == 80 {
+		opts.Logf("note: port 80 alone rides the tunnel's main channel, which the image server closes after one response; add -p 4700:4700 as well")
+	}
+	opts.Maps = maps
 	p := &proxy{opts: opts, cfg: cfg, state: "starting", since: time.Now(), up: make(chan struct{})}
 
 	// Bind before dialling: a port clash then costs nothing, where dialling first would
@@ -121,7 +134,7 @@ func Run(ctx context.Context, cfg seestar.ConnectConfig, opts Options) error {
 			return fmt.Errorf("listen: %w", err)
 		}
 		lns = append(lns, ln)
-		p.fwds = append(p.fwds, &forwarder{p: p, m: m, primary: i == 0})
+		p.fwds = append(p.fwds, &forwarder{p: p, m: m, primary: i == 0, perClient: i != 0 && m.Device == 80})
 	}
 	defer closeAll()
 
@@ -146,6 +159,8 @@ type proxy struct {
 	opts Options
 	cfg  seestar.ConnectConfig
 	fwds []*forwarder
+
+	openMu sync.Mutex // serialises channel opens
 
 	mu         sync.Mutex
 	tun        tunnel
@@ -189,7 +204,9 @@ func (p *proxy) supervise(ctx context.Context) error {
 		p.sessionBeg = began
 		p.mu.Unlock()
 		for i, f := range p.fwds {
-			f.attach(streams[i])
+			if streams[i] != nil {
+				f.attach(streams[i])
+			}
 		}
 		p.setState("connected", "")
 		p.mu.Lock()
@@ -231,7 +248,8 @@ func (p *proxy) supervise(ctx context.Context) error {
 	}
 }
 
-// dial opens the tunnel on the first mapping and an extra channel for each other mapping.
+// dial opens the tunnel on the first mapping and an extra channel for each other persistent
+// mapping.
 func (p *proxy) dial() (tunnel, []io.ReadWriteCloser, error) {
 	p.mu.Lock()
 	p.attempts++
@@ -241,8 +259,13 @@ func (p *proxy) dial() (tunnel, []io.ReadWriteCloser, error) {
 		return nil, nil, err
 	}
 	streams := []io.ReadWriteCloser{tun}
-	for _, m := range p.opts.Maps[1:] {
-		ch, err := tun.OpenChannel(m.Device)
+	for _, f := range p.fwds[1:] {
+		if f.perClient {
+			streams = append(streams, nil) // opened per client
+			continue
+		}
+		m := f.m
+		ch, err := p.openChannel(tun, m.Device)
 		if err != nil {
 			tun.Close()
 			return nil, nil, fmt.Errorf("open channel to :%d: %w", m.Device, err)
@@ -292,18 +315,25 @@ func (p *proxy) upChan() chan struct{} {
 	return p.up
 }
 
-// forwarder carries one mapped port. While the tunnel is up it holds a stream to the device
-// port. A reader runs for the stream's lifetime, discarding output when no client is
-// attached: the device pushes unsolicited data, which would otherwise queue and be delivered
-// to whoever connected next.
+// forwarder carries one mapped port. While the tunnel is up a persistent forwarder holds a
+// stream to the device port. A reader runs for the stream's lifetime, discarding output when
+// no client is attached: the device pushes unsolicited data, which would otherwise queue and
+// be delivered to whoever connected next.
+//
+// A per-client forwarder (device port 80) instead opens a fresh channel for every client and
+// closes it when the client leaves, because the scope's image server closes its socket after
+// each response and a reused channel would be dead for the next request. Several clients may
+// use a per-client mapping at once, as browsers expect.
 type forwarder struct {
-	p       *proxy
-	m       Mapping
-	primary bool
+	p         *proxy
+	m         Mapping
+	primary   bool
+	perClient bool
 
 	mu     sync.Mutex
 	stream io.ReadWriteCloser
 	client net.Conn
+	active int // per-client connections in flight
 
 	clients  atomic.Int64
 	toDevice atomic.Int64
@@ -311,6 +341,10 @@ type forwarder struct {
 }
 
 var errBusy = errors.New("another client is connected")
+
+// clientWriteTimeout bounds a write to a client. One that stops reading (a sleeping laptop,
+// a suspended app) is dropped rather than allowed to stall the device stream.
+var clientWriteTimeout = 10 * time.Second
 
 func (f *forwarder) attach(s io.ReadWriteCloser) {
 	f.mu.Lock()
@@ -334,29 +368,47 @@ func (f *forwarder) detach() {
 	}
 }
 
+// dropClient disconnects c if it is still the attached client.
+func (f *forwarder) dropClient(c net.Conn) {
+	f.mu.Lock()
+	if f.client == c {
+		f.client = nil
+	}
+	f.mu.Unlock()
+	c.Close()
+}
+
 func (f *forwarder) readLoop(s io.ReadWriteCloser) {
 	buf := make([]byte, 64*1024)
 	for {
 		n, err := s.Read(buf)
 		if n > 0 {
+			// Write outside the lock, so a slow client cannot block detach, claim or the
+			// status page. This loop is the only writer to the client, so order is kept.
 			f.mu.Lock()
-			if f.client != nil && f.stream == s {
-				if _, werr := f.client.Write(buf[:n]); werr == nil {
+			c := f.client
+			mine := f.stream == s
+			f.mu.Unlock()
+			if c != nil && mine {
+				c.SetWriteDeadline(time.Now().Add(clientWriteTimeout))
+				if _, werr := c.Write(buf[:n]); werr != nil {
+					f.dropClient(c)
+				} else {
 					f.toClient.Add(int64(n))
 				}
 			}
-			f.mu.Unlock()
 		}
 		if err != nil {
 			f.mu.Lock()
+			var c net.Conn
 			if f.stream == s {
 				f.stream = nil
-				if f.client != nil {
-					f.client.Close()
-					f.client = nil
-				}
+				c, f.client = f.client, nil
 			}
 			f.mu.Unlock()
+			if c != nil {
+				c.Close()
+			}
 			return
 		}
 	}
@@ -368,7 +420,11 @@ func (f *forwarder) accept(ctx context.Context, ln net.Listener) {
 		if err != nil {
 			return
 		}
-		go f.serve(ctx, conn)
+		if f.perClient {
+			go f.servePerClient(ctx, conn)
+		} else {
+			go f.serve(ctx, conn)
+		}
 	}
 }
 
@@ -405,6 +461,43 @@ func (f *forwarder) serve(ctx context.Context, conn net.Conn) {
 	f.mu.Unlock()
 }
 
+// servePerClient gives one client its own channel for the length of its connection.
+func (f *forwarder) servePerClient(ctx context.Context, conn net.Conn) {
+	defer conn.Close()
+	ch, err := f.p.openFresh(ctx, f.m.Device)
+	if err != nil {
+		replyError(conn, f.m.Device, err)
+		return
+	}
+	defer ch.Close()
+	f.clients.Add(1)
+	f.mu.Lock()
+	f.active++
+	f.mu.Unlock()
+	defer func() {
+		f.mu.Lock()
+		f.active--
+		f.mu.Unlock()
+	}()
+
+	go func() {
+		io.Copy(countingWriter{conn, &f.toClient}, ch)
+		conn.Close() // the device finished (or the tunnel dropped); end the client too
+	}()
+	io.Copy(countingWriter{ch, &f.toDevice}, conn)
+}
+
+type countingWriter struct {
+	w io.Writer
+	n *atomic.Int64
+}
+
+func (c countingWriter) Write(p []byte) (int, error) {
+	n, err := c.w.Write(p)
+	c.n.Add(int64(n))
+	return n, err
+}
+
 // claim makes conn the forwarder's client and returns the stream it should write to.
 func (f *forwarder) claim(ctx context.Context, conn net.Conn) (io.ReadWriteCloser, error) {
 	deadline := time.NewTimer(f.p.opts.ClientWait)
@@ -426,15 +519,9 @@ func (f *forwarder) claim(ctx context.Context, conn net.Conn) (io.ReadWriteClose
 		select {
 		case <-up:
 			// Connected. The redial normally attached this mapping already; only if its
-			// stream is still missing (the device closed that channel) is it reopened on
-			// the live tunnel rather than waiting for a full redial.
-			f.mu.Lock()
-			missing := f.stream == nil
-			f.mu.Unlock()
-			if missing {
-				if err := f.reopen(up); err != nil {
-					return nil, err
-				}
+			// stream is still missing is it reopened on the live tunnel.
+			if err := f.reopen(up); err != nil {
+				return nil, err
 			}
 		case <-deadline.C:
 			return nil, fmt.Errorf("device not connected (%s); try again shortly", f.p.statusLine())
@@ -444,13 +531,17 @@ func (f *forwarder) claim(ctx context.Context, conn net.Conn) (io.ReadWriteClose
 	}
 }
 
-// reopen opens a fresh channel for a non-primary mapping on the current tunnel.
+// reopen opens a fresh channel for a non-primary mapping whose stream is missing, on the
+// tunnel that up belongs to.
 func (f *forwarder) reopen(up chan struct{}) error {
-	f.p.mu.Lock()
-	tun := f.p.tun
-	current := f.p.up == up
-	f.p.mu.Unlock()
-	if tun == nil || !current {
+	f.mu.Lock()
+	missing := f.stream == nil
+	f.mu.Unlock()
+	if !missing {
+		return nil
+	}
+	tun := f.p.tunFor(up)
+	if tun == nil {
 		return nil // dropped or redialled meanwhile; claim loops and looks again
 	}
 	if f.primary {
@@ -462,19 +553,65 @@ func (f *forwarder) reopen(up chan struct{}) error {
 		}
 		return nil
 	}
-	ch, err := tun.OpenChannel(f.m.Device)
+	ch, err := f.p.openChannel(tun, f.m.Device)
 	if err != nil {
 		return fmt.Errorf("reopen channel to :%d: %w", f.m.Device, err)
 	}
+	// Attach only if this is still the current session and nothing attached meanwhile; the
+	// check and the set happen under one lock so a redial's stream is never overwritten.
+	f.p.mu.Lock()
 	f.mu.Lock()
-	if f.stream != nil {
-		f.mu.Unlock()
+	ok := f.p.up == up && f.p.tun == tun && f.stream == nil
+	if ok {
+		f.stream = ch
+	}
+	f.mu.Unlock()
+	f.p.mu.Unlock()
+	if !ok {
 		ch.Close()
 		return nil
 	}
-	f.mu.Unlock()
-	f.attach(ch)
+	go f.readLoop(ch)
 	return nil
+}
+
+// tunFor returns the live tunnel if up is still the current session's channel.
+func (p *proxy) tunFor(up chan struct{}) tunnel {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.up != up {
+		return nil
+	}
+	return p.tun
+}
+
+// openChannel serialises channel opens: the device handles one at a time, and Kalay
+// refuses a second open while one is in flight.
+func (p *proxy) openChannel(tun tunnel, port int) (io.ReadWriteCloser, error) {
+	p.openMu.Lock()
+	defer p.openMu.Unlock()
+	return tun.OpenChannel(port)
+}
+
+// openFresh waits up to ClientWait for the tunnel and opens a new channel to port on it.
+func (p *proxy) openFresh(ctx context.Context, port int) (io.ReadWriteCloser, error) {
+	deadline := time.NewTimer(p.opts.ClientWait)
+	defer deadline.Stop()
+	for {
+		up := p.upChan()
+		select {
+		case <-up:
+			tun := p.tunFor(up)
+			if tun == nil {
+				continue
+			}
+			return p.openChannel(tun, port)
+		case <-deadline.C:
+			return nil, fmt.Errorf("device not connected (%s); try again shortly", p.statusLine())
+		case <-ctx.Done():
+			return nil, errors.New("proxy shutting down")
+		}
+	}
 }
 
 // replyError reports a failure to the client, which would otherwise see only an empty
@@ -552,7 +689,8 @@ func (p *proxy) snapshot() Status {
 		f.mu.Lock()
 		ms := MappingStatus{
 			Local: f.m.Local, Device: f.m.Device,
-			Attached: f.stream != nil, Client: f.client != nil,
+			Attached: f.stream != nil || (f.perClient && st.State == "connected"),
+			Client:   f.client != nil || f.active > 0,
 		}
 		f.mu.Unlock()
 		ms.Clients, ms.BytesUp, ms.BytesDown = f.clients.Load(), f.toDevice.Load(), f.toClient.Load()

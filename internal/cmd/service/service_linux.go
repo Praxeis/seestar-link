@@ -62,7 +62,7 @@ func install(t target) error {
 		return err
 	}
 	var args []string
-	for _, a := range []string{exe, "service", "run", "-profile", t.profile} {
+	for _, a := range runArgs(exe, t) {
 		args = append(args, quote(a))
 	}
 	unit := fmt.Sprintf(`[Unit]

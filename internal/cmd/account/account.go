@@ -188,13 +188,8 @@ func Profile() {
 		os.Exit(2)
 	}
 	action := os.Args[1]
-	rest := os.Args[2:]
-	name := ""
-	if len(rest) > 0 && !strings.HasPrefix(rest[0], "-") {
-		name, rest = rest[0], rest[1:]
-	}
 	prog := cli.ProgName + " " + action
-	os.Args = append([]string{prog}, rest...)
+	os.Args = append([]string{prog}, os.Args[2:]...)
 	cli.ProgName = prog
 
 	var ports stringList
@@ -210,7 +205,15 @@ func Profile() {
 		makeDefault = flag.Bool("default", false, "make this the default profile")
 		addEmail = flag.String("email", "", "ZWO account email (default: the account of the current default profile)")
 	}
-	cli.ParseFlags(func() { fmt.Fprintf(os.Stderr, profileHelp, "seestar profile") })
+	usage := func() { fmt.Fprintf(os.Stderr, profileHelp, "seestar profile") }
+	cli.ParseFlags(usage)
+	name := ""
+	if pos := cli.ParseRest(usage); len(pos) > 0 {
+		name = pos[0]
+		if len(pos) > 1 {
+			fail(fmt.Errorf("unexpected arguments: %v", pos[1:]))
+		}
+	}
 
 	c, err := config.Load()
 	if err != nil {

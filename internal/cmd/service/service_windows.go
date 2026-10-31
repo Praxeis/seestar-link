@@ -4,12 +4,14 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"golang.org/x/sys/windows"
@@ -76,8 +78,8 @@ func install(t target) error {
 	if err := os.MkdirAll(programDir(), 0o755); err != nil {
 		return err
 	}
-	if src != exe {
-		if err := copyFile(src, exe); err != nil {
+	if src != exe && !sameContents(src, exe) {
+		if err := replaceProgram(src, exe); err != nil {
 			return fmt.Errorf("copy program to %s: %w", exe, err)
 		}
 	}
@@ -88,8 +90,17 @@ func install(t target) error {
 	if err := os.MkdirAll(filepath.Join(md, "logs"), 0o700); err != nil {
 		return err
 	}
-	if out, err := exec.Command("icacls", md, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F").CombinedOutput(); err != nil {
-		return fmt.Errorf("restrict %s: %v: %s", md, err, out)
+	// The machine-scope password can be decrypted by any process on this computer, so the
+	// folder's permissions are its protection. Take ownership (in case someone else created
+	// the folder first), clear every explicit entry, then allow only SYSTEM and Administrators.
+	for _, args := range [][]string{
+		{md, "/setowner", "*S-1-5-32-544", "/T", "/C", "/Q"},
+		{md, "/reset", "/T", "/C", "/Q"},
+		{md, "/inheritance:r", "/grant:r", "*S-1-5-18:(OI)(CI)F", "*S-1-5-32-544:(OI)(CI)F", "/Q"},
+	} {
+		if out, err := exec.Command("icacls", args...).CombinedOutput(); err != nil {
+			return fmt.Errorf("restrict %s: icacls %v: %v: %s", md, args[1:], err, out)
+		}
 	}
 	userDir, err := config.Dir()
 	if err != nil {
@@ -137,6 +148,44 @@ func install(t target) error {
 	fmt.Printf("Installed and started %q.\nProgram: %s\nLog: %s\nCheck it with: seestar status -profile %s\n",
 		t.display, exe, filepath.Join(md, "logs", t.profile+".log"), t.profile)
 	return nil
+}
+
+// replaceProgram installs src as dst. Another profile's service may be running dst, and a
+// running program cannot be overwritten on Windows, but it can be renamed: the old copy is
+// moved aside, and those services pick up the new one at their next restart.
+func replaceProgram(src, dst string) error {
+	old, _ := filepath.Glob(dst + ".old-*")
+	for _, o := range old {
+		os.Remove(o) // fails harmlessly while still running
+	}
+	if _, err := os.Stat(dst); err == nil {
+		if err := os.Rename(dst, fmt.Sprintf("%s.old-%d", dst, time.Now().Unix())); err != nil {
+			return err
+		}
+	}
+	return copyFile(src, dst)
+}
+
+// sameContents reports whether two files hold identical bytes.
+func sameContents(a, b string) bool {
+	ha, errA := fileHash(a)
+	hb, errB := fileHash(b)
+	return errA == nil && errB == nil && ha == hb
+}
+
+func fileHash(path string) ([32]byte, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return [32]byte{}, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return [32]byte{}, err
+	}
+	var out [32]byte
+	copy(out[:], h.Sum(nil))
+	return out, nil
 }
 
 func copyFile(src, dst string) error {
@@ -198,9 +247,25 @@ func uninstall(t target) error {
 	if err != nil {
 		return err
 	}
-	// Remove the machine copy of the password; the profile and log are left for reference.
+	// Drop this profile from the machine copy, and its password only if no other installed
+	// profile uses the same account. Logs are left for reference.
 	config.SetDir(machineDir())
-	secret.Delete(t.prof.Email)
+	if mc, err := config.Load(); err == nil {
+		delete(mc.Profiles, t.profile)
+		if mc.Default == t.profile {
+			mc.Default = ""
+		}
+		mc.Save()
+		shared := false
+		for _, p := range mc.Profiles {
+			if strings.EqualFold(p.Email, t.prof.Email) {
+				shared = true
+			}
+		}
+		if !shared {
+			secret.Delete(t.prof.Email)
+		}
+	}
 	fmt.Printf("Removed %q. Logs remain in %s.\n", t.display, filepath.Join(machineDir(), "logs"))
 	return nil
 }
@@ -237,23 +302,32 @@ var stateNames = map[svc.State]string{
 }
 
 func status(t target) error {
-	// Querying status does not need Administrator rights.
-	m, err := mgr.Connect()
+	// Query with the minimum rights, so this works from a normal terminal; mgr.Connect
+	// asks for full access, which only an Administrator gets.
+	scm, err := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if err != nil {
 		return err
 	}
-	defer m.Disconnect()
-	s, err := m.OpenService(t.name)
+	defer windows.CloseServiceHandle(scm)
+	name, err := windows.UTF16PtrFromString(t.name)
+	if err != nil {
+		return err
+	}
+	h, err := windows.OpenService(scm, name, windows.SERVICE_QUERY_STATUS)
 	if err != nil {
 		fmt.Printf("%s: not installed\n", t.display)
 		return nil
 	}
-	defer s.Close()
-	st, err := s.Query()
-	if err != nil {
+	defer windows.CloseServiceHandle(h)
+	var st windows.SERVICE_STATUS
+	if err := windows.QueryServiceStatus(h, &st); err != nil {
 		return err
 	}
-	fmt.Printf("%s: %s\nLog: %s\n", t.display, stateNames[st.State], filepath.Join(machineDir(), "logs", t.profile+".log"))
+	state, ok := stateNames[svc.State(st.CurrentState)]
+	if !ok {
+		state = fmt.Sprintf("state %d", st.CurrentState)
+	}
+	fmt.Printf("%s: %s\nLog: %s\n", t.display, state, filepath.Join(machineDir(), "logs", t.profile+".log"))
 	return nil
 }
 

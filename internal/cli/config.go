@@ -12,8 +12,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"golang.org/x/term"
 
@@ -322,12 +325,33 @@ func ParseFlags(usage func()) {
 	os.Exit(2)
 }
 
-// applyShared acts on the shared flags once parsed.
+// ParseRest parses flags that follow a positional argument, so "add NAME -p X" and
+// "add -p X NAME" both work. It returns the remaining positional arguments.
+func ParseRest(usage func()) []string {
+	var pos []string
+	for flag.NArg() > 0 {
+		pos = append(pos, flag.Arg(0))
+		if err := flag.CommandLine.Parse(flag.Args()[1:]); err != nil {
+			flag.CommandLine.SetOutput(os.Stderr)
+			usage()
+			fmt.Fprintf(os.Stderr, "\nerror: %v\n", err)
+			os.Exit(2)
+		}
+	}
+	applyShared()
+	return pos
+}
+
+var logApplied string
+
+// applyShared acts on the shared flags once parsed. It may run twice (ParseFlags, then
+// ParseRest), so each action is idempotent.
 func applyShared() {
 	if configDirFlag != "" {
 		config.SetDir(configDirFlag)
 	}
-	if logFlag != "" {
+	if logFlag != "" && logFlag != logApplied {
+		logApplied = logFlag
 		if err := RedirectOutput(logFlag); err != nil {
 			fmt.Fprintln(os.Stderr, err)
 			os.Exit(1)
@@ -335,21 +359,73 @@ func applyShared() {
 	}
 }
 
-// RedirectOutput sends everything the process prints to path, appending.
+// logMax is the size at which the -log file is rotated to path.1.
+const logMax = 5 << 20
+
+// Log is where commands write progress lines. It is stdout unless -log names a file, in
+// which case it rotates that file as it grows.
+var Log io.Writer = os.Stdout
+
+// Logf writes a timestamped line to Log.
+func Logf(format string, args ...any) {
+	fmt.Fprintf(Log, "%s  %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// RedirectOutput sends the process's output to path, appending. Lines written through Log
+// rotate the file at 5 MB; anything else printed (and a crash report) goes to the file
+// that was current at startup.
 func RedirectOutput(path string) error {
 	if dir := filepath.Dir(path); dir != "" {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("log: %w", err)
 		}
 	}
-	// Keep the log bounded: past 5 MB it is rotated to path.1, replacing the previous one.
-	if fi, err := os.Stat(path); err == nil && fi.Size() > 5<<20 {
-		os.Rename(path, path+".1")
-	}
-	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
-	if err != nil {
+	rf := &rotatingFile{path: path}
+	if err := rf.open(); err != nil {
 		return fmt.Errorf("log: %w", err)
 	}
-	os.Stdout, os.Stderr = f, f
+	os.Stdout, os.Stderr = rf.f, rf.f
+	debug.SetCrashOutput(rf.f, debug.CrashOptions{})
+	Log = rf
 	return nil
+}
+
+type rotatingFile struct {
+	mu   sync.Mutex
+	path string
+	f    *os.File
+	size int64
+}
+
+func (r *rotatingFile) open() error {
+	if fi, err := os.Stat(r.path); err == nil && fi.Size() > logMax {
+		os.Rename(r.path, r.path+".1")
+	}
+	f, err := os.OpenFile(r.path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return err
+	}
+	r.f, r.size = f, fi.Size()
+	return nil
+}
+
+func (r *rotatingFile) Write(p []byte) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.size+int64(len(p)) > logMax {
+		// Keep the old handle open: os.Stdout and the crash output may still point at it.
+		prev := r.f
+		os.Rename(r.path, r.path+".1")
+		if err := r.open(); err != nil {
+			r.f = prev
+		}
+	}
+	n, err := r.f.Write(p)
+	r.size += int64(n)
+	return n, err
 }

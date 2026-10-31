@@ -25,6 +25,8 @@ type fakeTun struct {
 	once               sync.Once
 	mu                 sync.Mutex
 	chans              []io.Closer
+	opens              int
+	dev                net.Conn // device end of the primary channel
 }
 
 func echo(dev net.Conn, tag string) {
@@ -41,7 +43,19 @@ func echo(dev net.Conn, tag string) {
 func newFakeTun(id, port int) *fakeTun {
 	cli, dev := net.Pipe()
 	go echo(dev, fmt.Sprintf("t%d:%d", id, port))
-	return &fakeTun{ReadWriteCloser: cli, id: id, done: make(chan struct{}), chans: []io.Closer{dev}}
+	return &fakeTun{ReadWriteCloser: cli, id: id, done: make(chan struct{}), chans: []io.Closer{dev}, dev: dev}
+}
+
+// echoOnce answers a single line and then ignores the channel, as the scope's HTTP server
+// does after closing its socket (Kalay does not report the close).
+func echoOnce(dev net.Conn, tag string) {
+	r := bufio.NewReader(dev)
+	line, err := r.ReadString('\n')
+	if err != nil {
+		return
+	}
+	fmt.Fprintf(dev, "%s %s", tag, line)
+	io.Copy(io.Discard, r)
 }
 
 func (f *fakeTun) OpenChannel(port int) (io.ReadWriteCloser, error) {
@@ -51,7 +65,15 @@ func (f *fakeTun) OpenChannel(port int) (io.ReadWriteCloser, error) {
 	default:
 	}
 	cli, dev := net.Pipe()
-	go echo(dev, fmt.Sprintf("t%d:%d", f.id, port))
+	f.mu.Lock()
+	f.opens++
+	n := f.opens
+	f.mu.Unlock()
+	if port == 80 {
+		go echoOnce(dev, fmt.Sprintf("t%d:%d#%d", f.id, port, n))
+	} else {
+		go echo(dev, fmt.Sprintf("t%d:%d", f.id, port))
+	}
 	f.mu.Lock()
 	f.chans = append(f.chans, dev, cli)
 	f.mu.Unlock()
@@ -315,4 +337,83 @@ func TestParseMapping(t *testing.T) {
 			t.Errorf("ParseMapping(%q) accepted", bad)
 		}
 	}
+}
+
+func TestPort80GetsAFreshChannelPerClient(t *testing.T) {
+	h := start(t, 4700, 80)
+	// Sequential requests: a reused channel would be dead after the first response.
+	for i, want := range []string{"t1:80#1 a", "t1:80#2 b", "t1:80#3 c"} {
+		got, c := h.roundTrip(1, string(rune('a'+i)))
+		c.Close()
+		if got != want {
+			t.Fatalf("request %d: got %q, want %q", i, got, want)
+		}
+	}
+	// Parallel requests are allowed on a per-client mapping.
+	var wg sync.WaitGroup
+	for i := range 3 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			got, c := h.roundTrip(1, fmt.Sprint("p", i))
+			c.Close()
+			if !strings.HasPrefix(got, "t1:80#") || !strings.HasSuffix(got, fmt.Sprint(" p", i)) {
+				t.Errorf("parallel request %d: got %q", i, got)
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestPort80IsNotThePrimaryChannel(t *testing.T) {
+	h := start(t, 80, 4700)
+	// The JSON-RPC port is moved to the tunnel's own channel; 80 is opened per client.
+	if got, c := h.roundTrip(0, "img"); got != "t1:80#1 img" {
+		t.Fatalf("port 80: got %q", got)
+	} else {
+		c.Close()
+	}
+	if got, c := h.roundTrip(1, "rpc"); got != "t1:4700 rpc" {
+		t.Fatalf("port 4700: got %q", got)
+	} else {
+		c.Close()
+	}
+}
+
+func TestStalledClientDoesNotBlockTheProxy(t *testing.T) {
+	old := clientWriteTimeout
+	clientWriteTimeout = 300 * time.Millisecond
+	t.Cleanup(func() { clientWriteTimeout = old })
+
+	h := start(t, 4700)
+	_, c := h.roundTrip(0, "hi")
+	defer c.Close()
+	// The scope pushes far more than a socket buffer while the client never reads.
+	go func() {
+		chunk := make([]byte, 64*1024)
+		for range 256 {
+			if _, err := h.tun(0).dev.Write(chunk); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(100 * time.Millisecond)
+	// The status page still answers while the client is stuck...
+	done := make(chan error, 1)
+	go func() { _, err := FetchStatus(h.status); done <- err }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("status page blocked behind a stalled client")
+	}
+	// ...and a dropped tunnel is still noticed and redialled.
+	h.tun(0).kill()
+	waitFor(t, "redial", func() bool { return h.dials.Load() >= 2 })
+	waitFor(t, "connected again", func() bool {
+		st, err := FetchStatus(h.status)
+		return err == nil && st.State == "connected" && st.Connects == 2
+	})
 }

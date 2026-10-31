@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/Praxeis/seestar-link/internal/cmd/proxy"
 )
@@ -56,7 +57,7 @@ func install(t target) error {
 	if err := os.MkdirAll(filepath.Dir(logPath(t)), 0o755); err != nil {
 		return err
 	}
-	args := []string{exe, "service", "run", "-profile", t.profile}
+	args := runArgs(exe, t)
 	var b strings.Builder
 	for _, a := range args {
 		fmt.Fprintf(&b, "\t\t<string>%s</string>\n", html.EscapeString(a))
@@ -86,13 +87,34 @@ func install(t target) error {
 	if err := os.WriteFile(pp, []byte(plist), 0o644); err != nil {
 		return err
 	}
-	launchctl("bootout", domain(), pp) // replace a running copy; fails harmlessly if none
-	if out, err := launchctl("bootstrap", domain(), pp); err != nil {
-		return fmt.Errorf("launchctl bootstrap: %v: %s", err, out)
+	unload(t, pp) // replace a running copy
+	var out string
+	for try := 0; ; try++ {
+		if out, err = launchctl("bootstrap", domain(), pp); err == nil {
+			break
+		}
+		if try == 4 {
+			return fmt.Errorf("launchctl bootstrap: %v: %s", err, out)
+		}
+		time.Sleep(time.Second) // the previous job may still be shutting down
 	}
 	fmt.Printf("Installed and started %q (runs while you are logged in).\nLog: %s\nCheck it with: seestar status -profile %s\n",
 		t.display, logPath(t), t.profile)
 	return nil
+}
+
+// unload stops the job and waits until launchd has let go of it, so an immediate bootstrap
+// does not fail with an I/O error.
+func unload(t target, pp string) {
+	if _, err := launchctl("bootout", domain(), pp); err != nil {
+		return // was not loaded
+	}
+	for i := 0; i < 20; i++ {
+		if _, err := launchctl("print", domain()+"/"+label(t)); err != nil {
+			return
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 func uninstall(t target) error {
@@ -100,7 +122,7 @@ func uninstall(t target) error {
 	if err != nil {
 		return err
 	}
-	launchctl("bootout", domain(), pp)
+	unload(t, pp)
 	if err := os.Remove(pp); err != nil && !os.IsNotExist(err) {
 		return err
 	}
@@ -133,7 +155,7 @@ func stop(t target) error {
 	}
 	// KeepAlive would restart a killed job, so stopping means unloading it until the next
 	// start or login.
-	launchctl("bootout", domain(), pp)
+	unload(t, pp)
 	fmt.Printf("Stopped %q until 'seestar service start' or your next login.\n", t.display)
 	return nil
 }

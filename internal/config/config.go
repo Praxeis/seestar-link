@@ -84,6 +84,18 @@ func Dir() (string, error) {
 	return filepath.Join(base, AppName), nil
 }
 
+// CustomDir returns the configuration directory when it was set explicitly (by SetDir or
+// SEESTAR_CONFIG_DIR), so a service can be started with the same one.
+func CustomDir() (string, bool) {
+	if dirOverride != "" {
+		return dirOverride, true
+	}
+	if d := os.Getenv("SEESTAR_CONFIG_DIR"); d != "" {
+		return d, true
+	}
+	return "", false
+}
+
 // Path returns the config file path.
 func Path() (string, error) {
 	d, err := Dir()

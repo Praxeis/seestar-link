@@ -75,6 +75,19 @@ func savedPassword(t target) (string, error) {
 	return pw, err
 }
 
+// runArgs is the command line a service manager starts: the run command for the profile,
+// plus the configuration directory if it is not the default one.
+func runArgs(exe string, t target) []string {
+	args := []string{exe, "service", "run", "-profile", t.profile}
+	if d, ok := config.CustomDir(); ok {
+		if abs, err := filepath.Abs(d); err == nil {
+			d = abs
+		}
+		args = append(args, "-config-dir", d)
+	}
+	return args
+}
+
 // executable returns the absolute, symlink-resolved path of the running binary.
 func executable() (string, error) {
 	exe, err := os.Executable()
@@ -100,21 +113,20 @@ func warnIfTransient(exe string) {
 
 // Main is 'seestar service'.
 func Main() {
-	if len(os.Args) < 2 || strings.HasPrefix(os.Args[1], "-") {
-		fmt.Fprintf(os.Stderr, help, cli.ProgName)
-		if len(os.Args) >= 2 && (os.Args[1] == "-h" || os.Args[1] == "--help" || os.Args[1] == "-help") {
-			os.Exit(0)
-		}
-		os.Exit(2)
-	}
-	action := os.Args[1]
-	prog := cli.ProgName + " " + action
-	os.Args = append([]string{prog}, os.Args[2:]...)
-	cli.ProgName = prog
-	cli.ParseFlags(func() {
+	usage := func() {
 		fmt.Fprintf(os.Stderr, help, "seestar service")
 		flag.PrintDefaults()
-	})
+	}
+	// The action may come before or after the flags: "install -profile s30" or
+	// "-profile s30 install".
+	cli.ParseFlags(usage)
+	pos := cli.ParseRest(usage)
+	if len(pos) != 1 {
+		usage()
+		os.Exit(2)
+	}
+	action := pos[0]
+	cli.ProgName += " " + action
 
 	if action == "run" {
 		// Started by the service manager; settings come from the flags it was given.

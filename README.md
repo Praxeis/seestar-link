@@ -117,14 +117,17 @@ Without `-p`, the profile's ports are used, else `4700:4700`.
 |---|---|
 | `4700` | JSON-RPC control API (newline-delimited JSON) |
 | `32323` | ASCOM Alpaca REST. The scope serves this itself, so NINA and ConformU can be pointed straight at it |
-| `80` | HTTP image server |
+| `80` | HTTP image server (a fresh channel per client; map another port as well) |
 
 Any tool speaking the Seestar LAN protocols works unchanged, because a mapped port looks
 like the device on localhost. All mappings share one tunnel, since the device rejects a
 second concurrent Kalay session. While the proxy runs it holds the device's single remote
 session, so the Seestar app cannot connect remotely at the same time; stop the proxy (or
 the service) to use the app. One client at a time per mapped port; a second is refused
-with an error.
+with an error. Port 80 is the exception: the scope's image server closes its socket after
+each response, so every client gets its own fresh channel, and several can be served at
+once. A client that stops reading for 10 seconds is disconnected, so it cannot stall the
+link for everyone else.
 
 **Reconnect.** If the tunnel drops, the proxy closes any connected clients, waits (5s,
 10s, 20s, 40s, then every 60s; back to 5s after a session that lasted two minutes),
