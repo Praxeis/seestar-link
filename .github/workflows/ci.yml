@@ -15,7 +15,16 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
       - run: go build ./...
       - run: go vet ./...
-      - run: go test -race ./...
+      - name: test
+        shell: bash
+        run: |
+          set -o pipefail
+          go test -race ./... 2>&1 | tee test.log || {
+            # Surface failures as annotations, visible on the run page without opening logs.
+            grep -E -- '--- FAIL|^FAIL|\.go:[0-9]+:|panic:' test.log | head -40 |
+              while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
       - name: cross-compile
         run: |
           for t in windows/amd64 darwin/arm64 darwin/amd64 linux/arm64 linux/arm; do
@@ -30,4 +39,13 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-      - run: go test ./...
+      - name: test
+        shell: bash
+        run: |
+          set -o pipefail
+          go test ./... 2>&1 | tee test.log || {
+            # Surface failures as annotations, visible on the run page without opening logs.
+            grep -E -- '--- FAIL|^FAIL|\.go:[0-9]+:|panic:' test.log | head -40 |
+              while IFS= read -r l; do echo "::error::$l"; done
+            exit 1
+          }
